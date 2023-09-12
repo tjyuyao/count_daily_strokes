@@ -1,13 +1,22 @@
 import os
 import shelve
-import time
+import time, datetime, pytz
 import PySimpleGUI as sg
-from typing import Tuple
+from typing import Dict, Tuple
 from psgtray import SystemTray
 from dataclasses import dataclass
 from pathlib import Path
 from pynput import mouse, keyboard
 from math import sqrt, fabs
+import tkinter
+
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.axes import Axes
+
+matplotlib.use('TkAgg')
 
 
 @dataclass
@@ -27,36 +36,74 @@ def get_icon():
 class Controller:
 
     def __init__(self) -> None:
+        
+        self._init_model()
+        
         menu = ['', ['Exit']]
 
-        layout = [[sg.T('Empty Window', key='-T-')]]
+        layout = [
+            [sg.Text('Recent 7 Days Trend')],
+            [sg.TabGroup([
+                [sg.Tab("Key Strokes", [[sg.Canvas(key='-CANVAS-K-')]])],
+                [sg.Tab("Mouse Clicks", [[sg.Canvas(key='-CANVAS-M-')]])],
+                [sg.Tab("Mouse Tracks", [[sg.Canvas(key='-CANVAS-L-')]])],
+            ])]
+        ]
 
-        self.window = sg.Window('Window Title', layout, finalize=True, enable_close_attempted_event=True, alpha_channel=0)
+        self.window = sg.Window('Daily Stroke Counter', layout, finalize=True, enable_close_attempted_event=True)
         self.window.hide()
+        self.window_visible = False
 
         self.tray = SystemTray(menu, single_click_events=False, window=self.window, tooltip='---', icon=get_icon(), key='-TRAY-')
         
-        self.db_file, self.stat = self._init_model()
+        self.figures = {k: matplotlib.figure.Figure(figsize=(5, 4), dpi=100) for k in "KML"}
+        self.plts: Dict[str, Axes] = {k:f.add_subplot(111) for k, f in self.figures.items()}
+        self.tkcanvas = {k:self._init_canvas(figure=f, canvas=self.window[f'-CANVAS-{k}-'].TKCanvas) for k, f in self.figures.items()}
+
+        self.dpi = self.window.TKroot.winfo_fpixels('1i') / 2.54 * 100
+
+    def _update_stat(self, init=False):
+        self.todate = datetime.datetime.now(tz=pytz.timezone('Asia/Shanghai')).date().strftime("%Y-%m-%d")
+        if self.todate not in self.db_file:
+            stat = Model()
+            stat.time_tick = time.time()
+            self.db_file[self.todate] = stat
+            self.stat = self.db_file[self.todate]
+        elif init:
+            self.stat = self.db_file[self.todate]
+
+    def _init_model(self):
+        db_loc = Path.home() / ".daily_stroke_counter"
+        db_loc.mkdir(parents=True, exist_ok=True)
+        db_path = db_loc / "database"
+        self.db_file = shelve.open(str(db_path), writeback=True)
+        self._update_stat(init=True)
 
     @staticmethod
-    def _init_model():
-        username = os.getlogin()
-        db_loc = Path.home() / "daily_stroke_counter"
-        db_loc.mkdir(parents=True, exist_ok=True)
-        db_path = db_loc / ".database"
-        db_file = shelve.open(str(db_path), writeback=True)
-        userstat = db_file.get(username, Model())
-        userstat.time_tick = time.time()
-        return db_file, userstat
-
+    def _init_canvas(figure, canvas):
+        tkcanvas = FigureCanvasTkAgg(figure, canvas)
+        tkcanvas.draw()
+        tkcanvas.get_tk_widget().pack(side='top', fill='both', expand=1)
+        return tkcanvas
+    
     def run(self):
         while True:
             event, values = self.window.read(timeout=1000)
 
             self.sync()
-            
+
             if event == self.tray.key:
                 event = values[event]
+
+            if event in ('Show Window', sg.EVENT_SYSTEM_TRAY_ICON_DOUBLE_CLICKED):
+                self.window.un_hide()
+                self.window.bring_to_front()
+                self.window_visible = True
+
+            elif event in ('Hide Window', sg.WIN_CLOSE_ATTEMPTED_EVENT):
+                self.window.hide()
+                self.tray.show_icon()
+                self.window_visible = False
 
             if event in (sg.WIN_CLOSED, 'Exit'):
                 break
@@ -66,9 +113,37 @@ class Controller:
         self.window.close()
 
     def sync(self):
-        text = f"K:{self.stat.num_keystrokes}\nM:{self.stat.num_mouse_clicks}\nL:{self.stat.length_mouse_track:.0f}"
+        text = f"K:{self.stat.num_keystrokes}\nM:{self.stat.num_mouse_clicks}\nL:{self.stat.length_mouse_track:.0f} m"
         self.tray.set_tooltip(text)
+        self.db_file[self.todate] = self.stat
         self.db_file.sync()
+        self._update_stat()
+
+        if self.window_visible:
+            self.draw()
+
+    def draw(self):
+        dates = sorted(self.db_file.keys())
+        dates = dates[-7:]
+        idate = np.arange(len(dates))
+        data = dict(K=[], M=[], L=[])
+        for date in dates:
+            stat: Model = self.db_file[date]
+            data['K'].append(stat.num_keystrokes)
+            data['M'].append(stat.num_mouse_clicks)
+            data['L'].append(stat.length_mouse_track)
+        colors = dict(
+            K="blue",
+            M="purple",
+            L="orange",
+        )
+        for k in "KML":
+            plt = self.plts[k]
+            yaxis = np.array(data[k])
+            plt.cla()
+            plt.set_xticks(idate, dates)
+            plt.plot(idate, yaxis, marker='o', color=colors[k])
+            self.tkcanvas[k].draw()
 
 
 ctrl = Controller()
@@ -79,7 +154,7 @@ def on_move(nx, ny):
     if ctrl.stat.prev_mouse_loc is not None and \
         now - ctrl.stat.time_tick > ctrl.stat.move_period:
         px, py = ctrl.stat.prev_mouse_loc
-        ctrl.stat.length_mouse_track += sqrt((px-nx)*(px-nx) + (py-ny)*(py-ny))
+        ctrl.stat.length_mouse_track += sqrt((px-nx)*(px-nx) + (py-ny)*(py-ny)) / ctrl.dpi
         ctrl.stat.time_tick = now
     ctrl.stat.prev_mouse_loc = (nx, ny)
 
